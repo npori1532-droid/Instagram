@@ -32,8 +32,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Configuration
-BOT_TOKEN = os.environ.get('BOT_TOKEN', "8280145219:AAEdlTeRc6nBvbAGEPpZU_CI8ONxGWruywc")
+# Configuration - USE ENVIRONMENT VARIABLES
+BOT_TOKEN = os.environ.get('BOT_TOKEN', "your_bot_token_here")
 ADMIN_ID = int(os.environ.get('ADMIN_ID', 6973940391))
 API_URL = "https://instagram-x-info.vercel.app/api/insta/r2x_4y"
 
@@ -76,7 +76,8 @@ async def check_membership(user_id: int, bot):
         
         return (channel_status.status in ['member', 'administrator', 'creator'] and 
                 group_status.status in ['member', 'administrator', 'creator'])
-    except:
+    except Exception as e:
+        logger.error(f"Error checking membership: {e}")
         return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -92,9 +93,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_id=user.id,
                 username=user.username,
                 first_name=user.first_name,
-                last_name=user.last_name
+                last_name=user.last_name,
+                last_active=datetime.utcnow()
             )
             db.add(new_user)
+        else:
+            existing_user.last_active = datetime.utcnow()
         db.commit()
         
         # Check membership
@@ -153,7 +157,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Error in start: {e}")
+        await update.message.reply_text("❌ An error occurred. Please try again.")
     finally:
         db.close()
 
@@ -162,50 +167,52 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    if query.data == "verify":
-        is_member = await check_membership(query.from_user.id, context.bot)
-        
-        if is_member:
-            db = SessionLocal()
-            user_record = db.query(User).filter(User.user_id == query.from_user.id).first()
-            if user_record:
-                user_record.is_member = True
-                db.commit()
-            db.close()
+    try:
+        if query.data == "verify":
+            is_member = await check_membership(query.from_user.id, context.bot)
             
-            await query.edit_message_text(
-                "✅ *Verified successfully! You can now use the bot.*\n\n"
-                "📌 *Send any Instagram username to get info.*",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await query.edit_message_text(
-                "❌ *You haven't joined both channel and group yet.*\n"
-                "Please join both and try again.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-    
-    elif query.data == "dev_info":
-        dev_text = """*👨‍💻 Developer Information*
+            if is_member:
+                db = SessionLocal()
+                user_record = db.query(User).filter(User.user_id == query.from_user.id).first()
+                if user_record:
+                    user_record.is_member = True
+                    user_record.last_active = datetime.utcnow()
+                    db.commit()
+                db.close()
+                
+                await query.edit_message_text(
+                    "✅ *Verified successfully! You can now use the bot.*\n\n"
+                    "📌 *Send any Instagram username to get info.*",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            else:
+                await query.edit_message_text(
+                    "❌ *You haven't joined both channel and group yet.*\n"
+                    "Please join both and try again.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        
+        elif query.data == "dev_info":
+            dev_text = """*👨‍💻 Developer Information*
 
 🤖 *Bot Developer:* tech master
 👑 *Team Owner:* @gajarbotol
 ⚡ *Admin:* @victoriababe
 
 🔧 *For support contact admin*"""
+            
+            await query.edit_message_text(
+                dev_text,
+                parse_mode=ParseMode.MARKDOWN
+            )
         
-        await query.edit_message_text(
-            dev_text,
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    elif query.data == "admin_panel" and query.from_user.id == ADMIN_ID:
-        db = SessionLocal()
-        total_users = db.query(User).count()
-        verified = db.query(User).filter(User.is_member == True).count()
-        db.close()
-        
-        admin_text = f"""*⚙️ Admin Panel*
+        elif query.data == "admin_panel" and query.from_user.id == ADMIN_ID:
+            db = SessionLocal()
+            total_users = db.query(User).count()
+            verified = db.query(User).filter(User.is_member == True).count()
+            db.close()
+            
+            admin_text = f"""*⚙️ Admin Panel*
 
 👥 *Total Users:* {total_users}
 ✅ *Verified:* {verified}
@@ -213,12 +220,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📌 *Admin Commands:*
 /stats - Bot statistics
-/users - List all users"""
-        
-        await query.edit_message_text(
-            admin_text,
-            parse_mode=ParseMode.MARKDOWN
-        )
+/broadcast - Broadcast message"""
+            
+            await query.edit_message_text(
+                admin_text,
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    except Exception as e:
+        logger.error(f"Error in button_handler: {e}")
 
 async def handle_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle Instagram username"""
@@ -241,7 +251,7 @@ async def handle_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"{API_URL}/{username}") as response:
+            async with session.get(f"{API_URL}/{username}", timeout=30) as response:
                 if response.status == 200:
                     data = await response.json()
                     
@@ -258,7 +268,8 @@ async def handle_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         result += f"\n📸 *Posts:* {data.get('posts'):,}"
                     
                     if data.get('biography'):
-                        result += f"\n📝 *Bio:*\n`{data.get('biography')}`"
+                        bio = data.get('biography')[:500] + "..." if len(data.get('biography')) > 500 else data.get('biography')
+                        result += f"\n📝 *Bio:*\n`{bio}`"
                     
                     await msg.delete()
                     await update.message.reply_text(result, parse_mode=ParseMode.MARKDOWN)
@@ -269,7 +280,14 @@ async def handle_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode=ParseMode.MARKDOWN
                     )
     
+    except asyncio.TimeoutError:
+        await msg.delete()
+        await update.message.reply_text(
+            "❌ *Request timeout.*\nPlease try again later.",
+            parse_mode=ParseMode.MARKDOWN
+        )
     except Exception as e:
+        logger.error(f"Error fetching Instagram data: {e}")
         await msg.delete()
         await update.message.reply_text(
             "❌ *Error fetching data.*\nPlease try again later.",
@@ -295,10 +313,17 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(stats, parse_mode=ParseMode.MARKDOWN)
 
+async def post_init(application: Application):
+    """Post initialization"""
+    await application.bot.set_my_commands([
+        BotCommand("start", "Start the bot"),
+        BotCommand("stats", "Bot statistics (admin only)")
+    ])
+
 def main():
     """Main function"""
     # Create application
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     
     # Add handlers
     app.add_handler(CommandHandler("start", start))
@@ -309,19 +334,22 @@ def main():
     # Start bot
     port = int(os.environ.get('PORT', 8080))
     
-    if 'RENDER' in os.environ:  # Running on Render
-        webhook_url = os.environ.get('WEBHOOK_URL')
+    # For Render deployment
+    if 'RENDER' in os.environ or 'WEBHOOK_URL' in os.environ:
+        webhook_url = os.environ.get('WEBHOOK_URL', '')
         if webhook_url:
             app.run_webhook(
                 listen="0.0.0.0",
                 port=port,
                 url_path=BOT_TOKEN,
-                webhook_url=f"{webhook_url}/{BOT_TOKEN}"
+                webhook_url=f"{webhook_url}/{BOT_TOKEN}",
+                drop_pending_updates=True
             )
         else:
-            app.run_polling()
+            logger.info("WEBHOOK_URL not set, using polling")
+            app.run_polling(drop_pending_updates=True)
     else:  # Local development
-        app.run_polling()
+        app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
