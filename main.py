@@ -22,7 +22,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, scoped_session
 import pytz
 
 # Logging setup
@@ -33,7 +33,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration - USE ENVIRONMENT VARIABLES
-BOT_TOKEN = os.environ.get('BOT_TOKEN', "your_bot_token_here")
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_ID = int(os.environ.get('ADMIN_ID', 6973940391))
 API_URL = "https://instagram-x-info.vercel.app/api/insta/r2x_4y"
 
@@ -50,21 +50,34 @@ class User(Base):
     __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, unique=True)
-    username = Column(String)
-    first_name = Column(String)
-    last_name = Column(String)
+    username = Column(String(100))
+    first_name = Column(String(100))
+    last_name = Column(String(100))
     is_member = Column(Boolean, default=False)
     join_date = Column(DateTime, default=datetime.utcnow)
     last_active = Column(DateTime, default=datetime.utcnow)
 
-# Database URL
+# Database URL - Render এর জন্য
 DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///bot.db')
-if DATABASE_URL.startswith("postgres://"):
+
+# PostgreSQL এর জন্য URL format ঠিক করুন
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(DATABASE_URL)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, echo=False)
 Base.metadata.create_all(engine)
-SessionLocal = sessionmaker(bind=engine)
+
+# Thread-safe session তৈরি করুন
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+session_factory = scoped_session(SessionLocal)
+
+def get_db():
+    """Database session generator"""
+    db = session_factory()
+    try:
+        yield db
+    finally:
+        db.close()
 
 async def check_membership(user_id: int, bot):
     """Check if user joined channel and group"""
@@ -83,8 +96,8 @@ async def check_membership(user_id: int, bot):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start command handler"""
     user = update.effective_user
-    db = SessionLocal()
     
+    db = session_factory()
     try:
         # Save user to database
         existing_user = db.query(User).filter(User.user_id == user.id).first()
@@ -97,9 +110,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 last_active=datetime.utcnow()
             )
             db.add(new_user)
+            db.commit()
         else:
             existing_user.last_active = datetime.utcnow()
-        db.commit()
+            db.commit()
         
         # Check membership
         is_member = await check_membership(user.id, context.bot)
@@ -116,7 +130,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             keyboard = [
                 [InlineKeyboardButton("👨‍💻 Developer Info", callback_data="dev_info")],
-                [InlineKeyboardButton("📊 My Stats", callback_data="my_stats")]
             ]
             
             if user.id == ADMIN_ID:
@@ -172,7 +185,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_member = await check_membership(query.from_user.id, context.bot)
             
             if is_member:
-                db = SessionLocal()
+                db = session_factory()
                 user_record = db.query(User).filter(User.user_id == query.from_user.id).first()
                 if user_record:
                     user_record.is_member = True
@@ -207,7 +220,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         
         elif query.data == "admin_panel" and query.from_user.id == ADMIN_ID:
-            db = SessionLocal()
+            db = session_factory()
             total_users = db.query(User).count()
             verified = db.query(User).filter(User.is_member == True).count()
             db.close()
@@ -229,6 +242,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     except Exception as e:
         logger.error(f"Error in button_handler: {e}")
+        await query.edit_message_text("❌ An error occurred. Please try again.")
 
 async def handle_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle Instagram username"""
@@ -251,7 +265,7 @@ async def handle_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"{API_URL}/{username}", timeout=30) as response:
+            async with session.get(f"{API_URL}/{username}", timeout=10) as response:
                 if response.status == 200:
                     data = await response.json()
                     
@@ -260,15 +274,21 @@ async def handle_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE):
 👤 *Username:* @{data.get('username', username)}
 📛 *Name:* {data.get('full_name', 'N/A')}"""
                     
-                    if data.get('followers'):
-                        result += f"\n👥 *Followers:* {data.get('followers'):,}"
-                    if data.get('following'):
-                        result += f"\n🤝 *Following:* {data.get('following'):,}"
-                    if data.get('posts'):
-                        result += f"\n📸 *Posts:* {data.get('posts'):,}"
+                    followers = data.get('followers')
+                    if followers is not None:
+                        result += f"\n👥 *Followers:* {followers:,}"
                     
-                    if data.get('biography'):
-                        bio = data.get('biography')[:500] + "..." if len(data.get('biography')) > 500 else data.get('biography')
+                    following = data.get('following')
+                    if following is not None:
+                        result += f"\n🤝 *Following:* {following:,}"
+                    
+                    posts = data.get('posts')
+                    if posts is not None:
+                        result += f"\n📸 *Posts:* {posts:,}"
+                    
+                    biography = data.get('biography')
+                    if biography:
+                        bio = biography[:300] + "..." if len(biography) > 300 else biography
                         result += f"\n📝 *Bio:*\n`{bio}`"
                     
                     await msg.delete()
@@ -297,21 +317,27 @@ async def handle_instagram(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin stats command"""
     if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Access denied.")
         return
     
-    db = SessionLocal()
-    total = db.query(User).count()
-    verified = db.query(User).filter(User.is_member == True).count()
-    db.close()
-    
-    stats = f"""*📊 Bot Statistics*
+    db = session_factory()
+    try:
+        total = db.query(User).count()
+        verified = db.query(User).filter(User.is_member == True).count()
+        
+        stats = f"""*📊 Bot Statistics*
 
 👥 Total Users: {total}
 ✅ Verified: {verified}
 ❌ Pending: {total - verified}
 🕒 Time: {datetime.now().strftime('%Y-%m-%d %H:%M')}"""
-    
-    await update.message.reply_text(stats, parse_mode=ParseMode.MARKDOWN)
+        
+        await update.message.reply_text(stats, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Error in admin_stats: {e}")
+        await update.message.reply_text("❌ Error getting stats.")
+    finally:
+        db.close()
 
 async def post_init(application: Application):
     """Post initialization"""
@@ -322,6 +348,11 @@ async def post_init(application: Application):
 
 def main():
     """Main function"""
+    # Validate BOT_TOKEN
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN not found in environment variables!")
+        return
+    
     # Create application
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     
@@ -331,24 +362,30 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_instagram))
     
-    # Start bot
+    # Get port from environment
     port = int(os.environ.get('PORT', 8080))
     
-    # For Render deployment
-    if 'RENDER' in os.environ or 'WEBHOOK_URL' in os.environ:
-        webhook_url = os.environ.get('WEBHOOK_URL', '')
-        if webhook_url:
+    # Check if we're in production (Render)
+    if 'RENDER' in os.environ:
+        # Get the Render external URL
+        render_external_url = os.environ.get('RENDER_EXTERNAL_URL')
+        
+        if render_external_url:
+            # Set webhook for Render
+            logger.info(f"Setting webhook for URL: {render_external_url}")
             app.run_webhook(
                 listen="0.0.0.0",
                 port=port,
                 url_path=BOT_TOKEN,
-                webhook_url=f"{webhook_url}/{BOT_TOKEN}",
+                webhook_url=f"{render_external_url}/{BOT_TOKEN}",
                 drop_pending_updates=True
             )
         else:
-            logger.info("WEBHOOK_URL not set, using polling")
+            logger.warning("RENDER_EXTERNAL_URL not found, using polling")
             app.run_polling(drop_pending_updates=True)
-    else:  # Local development
+    else:
+        # Local development - use polling
+        logger.info("Starting bot with polling...")
         app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
